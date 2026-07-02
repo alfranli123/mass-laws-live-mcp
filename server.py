@@ -56,6 +56,9 @@ def get_client() -> httpx.AsyncClient:
 # ---------------------------------------------------------------------------
 _cache: dict[str, tuple[float, Any]] = {}
 
+# Shared across all searches so total upstream concurrency is bounded globally.
+_fetch_sem = asyncio.Semaphore(SEARCH_SEMAPHORE_LIMIT)
+
 
 def _cached(key: str) -> Any | None:
     entry = _cache.get(key)
@@ -187,6 +190,8 @@ async def get_part(part_code: str) -> dict[str, Any]:
     detail = await _api_get(f"/Parts/{part_code}", cache_key=f"part_{part_code}")
     if isinstance(detail, dict) and "error" in detail:
         return detail
+    if not isinstance(detail, dict):
+        return {"error": f"unexpected response shape: {type(detail).__name__}"}
     chapters = [
         c["Code"] for c in detail.get("Chapters", [])
     ]
@@ -210,6 +215,8 @@ async def get_chapter(chapter_code: str) -> dict[str, Any]:
     )
     if isinstance(detail, dict) and "error" in detail:
         return detail
+    if not isinstance(detail, dict):
+        return {"error": f"unexpected response shape: {type(detail).__name__}"}
     sections = [
         s["Code"] for s in detail.get("Sections", [])
     ]
@@ -239,6 +246,8 @@ async def get_section(chapter_code: str, section_code: str) -> dict[str, Any]:
     )
     if isinstance(detail, dict) and "error" in detail:
         return detail
+    if not isinstance(detail, dict):
+        return {"error": f"unexpected response shape: {type(detail).__name__}"}
     text = detail.get("Text", "")
     return {
         "code": detail.get("Code"),
@@ -267,11 +276,12 @@ async def search_chapter(
     )
     if isinstance(chapter, dict) and "error" in chapter:
         return [chapter]
+    if not isinstance(chapter, dict):
+        return [{"error": f"unexpected response shape: {type(chapter).__name__}"}]
 
     section_infos = chapter.get("Sections", [])
-    sem = asyncio.Semaphore(SEARCH_SEMAPHORE_LIMIT)
 
-    async def _fetch_section(sinfo: dict) -> dict | None:
+    async def _fetch_section(sinfo: dict) -> dict | list | None:
         code = sinfo["Code"]
         safe_code = code.replace("/", "~")
         cache_key = f"section_{chapter_code}_{safe_code}"
@@ -279,7 +289,7 @@ async def search_chapter(
         if cached is not None:
             data = cached
         else:
-            async with sem:
+            async with _fetch_sem:
                 data = await _api_get(
                     f"/Chapters/{chapter_code}/Sections/{safe_code}",
                     cache_key=cache_key,
@@ -326,10 +336,15 @@ async def get_session_law(year: int, chapter_number: int) -> dict[str, Any]:
     )
     if isinstance(detail, dict) and "error" in detail:
         return detail
-    # Session laws may have ChapterText (HTML) or Text or DocumentText
-    text = detail.get("Text") or detail.get("DocumentText") or detail.get("ChapterText", "")
-    if detail.get("ChapterText"):
-        text = _strip_html(text)
+    if not isinstance(detail, dict):
+        return {"error": f"unexpected response shape: {type(detail).__name__}"}
+    # Session laws may have Text or DocumentText (plain) or ChapterText (HTML).
+    # Only strip HTML when ChapterText is the source actually used.
+    text = detail.get("Text") or detail.get("DocumentText")
+    if not text:
+        text = detail.get("ChapterText") or ""
+        if text:
+            text = _strip_html(text)
     return {
         "year": year,
         "chapter_number": chapter_number,
@@ -360,6 +375,8 @@ async def get_bill(
 
     if isinstance(detail, dict) and "error" in detail:
         return detail
+    if not isinstance(detail, dict):
+        return {"error": f"unexpected response shape: {type(detail).__name__}"}
 
     text = detail.get("DocumentText") or detail.get("Text") or ""
     return {
